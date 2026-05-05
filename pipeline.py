@@ -94,6 +94,9 @@ for experiment in [["phase1", "phase3"], ["phase1"]]:
 
     df_scaled = pd.concat(scaled_data, ignore_index=True)
 
+    if "phase3" in experiment:
+        df_scaled_p1p3 = df_scaled.copy()
+
     logo = LeaveOneGroupOut()
     groups = df_scaled['Individual']
 
@@ -200,6 +203,145 @@ for experiment in [["phase1", "phase3"], ["phase1"]]:
     all_corr_dfs[exp_label] = corr_df.copy()
     if "phase3" in experiment:
         results_phase1_phase3 = results_df.copy()
+
+
+# ── Nested LOSO: tune nu per outer fold (Experiment 1 baseline only) ──────────
+nu_candidates = [0.01, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50]
+baseline_phases = ["phase1", "phase3"]
+
+logo_nested = LeaveOneGroupOut()
+groups_nested = df_scaled_p1p3['Individual']
+
+nested_results = []
+all_outer_nu_means = {nu: [] for nu in nu_candidates}
+
+print("Running nested LOSO for nu tuning...")
+for outer_idx, (outer_train_idx, outer_test_idx) in enumerate(
+        logo_nested.split(df_scaled_p1p3, groups=groups_nested)):
+    train_df = df_scaled_p1p3.iloc[outer_train_idx]
+    test_df  = df_scaled_p1p3.iloc[outer_test_idx]
+    test_subject = test_df['Individual'].iloc[0]
+
+    # Inner LOSO over the 25 training subjects to select best nu
+    inner_logo   = LeaveOneGroupOut()
+    inner_groups = train_df['Individual']
+    nu_scores    = {nu: [] for nu in nu_candidates}
+
+    for inner_train_idx, inner_test_idx in inner_logo.split(train_df, groups=inner_groups):
+        inner_train = train_df.iloc[inner_train_idx]
+        inner_test  = train_df.iloc[inner_test_idx]
+
+        inner_train_rest = inner_train[inner_train['Phase'].isin(baseline_phases)][data_columns]
+        inner_test_p1    = inner_test[inner_test['Phase'] == "phase1"][data_columns]
+        inner_test_p2    = inner_test[inner_test['Phase'] == "phase2"][data_columns]
+        inner_test_p3    = inner_test[inner_test['Phase'] == "phase3"][data_columns]
+        if len(inner_train_rest) == 0 or len(inner_test_p2) == 0:
+            continue
+
+        pca_inner = PCA(n_components=0.95)
+        pca_inner.fit(inner_train_rest)
+        inner_train_rest_pca = pca_inner.transform(inner_train_rest)
+        inner_test_p1_pca    = pca_inner.transform(inner_test_p1) if len(inner_test_p1) > 0 else None
+        inner_test_p2_pca    = pca_inner.transform(inner_test_p2)
+        inner_test_p3_pca    = pca_inner.transform(inner_test_p3) if len(inner_test_p3) > 0 else None
+
+        for nu in nu_candidates:
+            ocsvm_inner = OneClassSVM(kernel='rbf', nu=nu, gamma='scale')
+            ocsvm_inner.fit(inner_train_rest_pca)
+            r_p2 = (np.sum(ocsvm_inner.predict(inner_test_p2_pca) == -1) / len(inner_test_p2_pca)) * 100
+            r_p1 = (np.sum(ocsvm_inner.predict(inner_test_p1_pca) == -1) / len(inner_test_p1_pca)) * 100 \
+                   if inner_test_p1_pca is not None else 0.0
+            r_p3 = (np.sum(ocsvm_inner.predict(inner_test_p3_pca) == -1) / len(inner_test_p3_pca)) * 100 \
+                   if inner_test_p3_pca is not None else 0.0
+            # Discrimination score: reward Phase 2 detection, penalise false positives in rest phases
+            score = r_p2 - (r_p1 + r_p3) / 2
+            nu_scores[nu].append(score)
+
+    nu_mean_rates = {nu: np.mean(nu_scores[nu]) if nu_scores[nu] else 0.0
+                     for nu in nu_candidates}
+    nu_std_rates  = {nu: np.std(nu_scores[nu],  ddof=1) if len(nu_scores[nu]) > 1 else 0.0
+                     for nu in nu_candidates}
+
+    # 1-SE rule: find the nu with the best mean score, compute its SE,
+    # then pick the smallest nu (tightest boundary) within 1 SE of that best.
+    best_nu_raw = max(nu_candidates, key=lambda nu: nu_mean_rates[nu])
+    n_inner     = len(nu_scores[best_nu_raw])
+    se_best     = nu_std_rates[best_nu_raw] / np.sqrt(n_inner) if n_inner > 0 else 0.0
+    threshold   = nu_mean_rates[best_nu_raw] - se_best
+    best_nu     = min(nu for nu in nu_candidates if nu_mean_rates[nu] >= threshold)
+
+    for nu in nu_candidates:
+        all_outer_nu_means[nu].append(nu_mean_rates[nu])
+
+    # Outer fold evaluation with selected best_nu
+    train_rest  = train_df[train_df['Phase'].isin(baseline_phases)][data_columns]
+    test_p1     = test_df[test_df['Phase'] == "phase1"][data_columns]
+    test_p2     = test_df[test_df['Phase'] == "phase2"][data_columns]
+    test_p3     = test_df[test_df['Phase'] == "phase3"][data_columns]
+
+    pca_outer = PCA(n_components=0.95)
+    pca_outer.fit(train_rest)
+    train_rest_pca = pca_outer.transform(train_rest)
+    test_p1_pca    = pca_outer.transform(test_p1)
+    test_p2_pca    = pca_outer.transform(test_p2)
+    test_p3_pca    = pca_outer.transform(test_p3)
+
+    ocsvm_outer = OneClassSVM(kernel='rbf', nu=best_nu, gamma='scale')
+    ocsvm_outer.fit(train_rest_pca)
+    preds_p1 = ocsvm_outer.predict(test_p1_pca)
+    preds_p2 = ocsvm_outer.predict(test_p2_pca)
+    preds_p3 = ocsvm_outer.predict(test_p3_pca)
+
+    rate_p1 = (np.sum(preds_p1 == -1) / len(preds_p1)) * 100 if len(preds_p1) > 0 else 0
+    rate_p2 = (np.sum(preds_p2 == -1) / len(preds_p2)) * 100 if len(preds_p2) > 0 else 0
+    rate_p3 = (np.sum(preds_p3 == -1) / len(preds_p3)) * 100 if len(preds_p3) > 0 else 0
+
+    row = {'Test_Subject': test_subject, 'Best_nu': best_nu,
+           'Rate_p1%': rate_p1, 'Rate_p2%': rate_p2, 'Rate_p3%': rate_p3}
+    for nu in nu_candidates:
+        row[f'inner_mean_p2_nu{nu}'] = round(nu_mean_rates[nu], 2)
+    nested_results.append(row)
+    print(f"  Fold {outer_idx+1:2d}/26 — best nu={best_nu:.2f}  "
+          f"P1={rate_p1:.0f}%  P2={rate_p2:.0f}%  P3={rate_p3:.0f}%")
+
+nested_df = pd.DataFrame(nested_results)
+nested_df.to_csv(os.path.join("output", "nested_cv_nu_results.csv"), index=False)
+print(f"\nNested CV results (n=26 folds):")
+print(f"  Phase 1: {nested_df['Rate_p1%'].mean():.1f} ± {nested_df['Rate_p1%'].std():.1f}%")
+print(f"  Phase 2: {nested_df['Rate_p2%'].mean():.1f} ± {nested_df['Rate_p2%'].std():.1f}%")
+print(f"  Phase 3: {nested_df['Rate_p3%'].mean():.1f} ± {nested_df['Rate_p3%'].std():.1f}%")
+print(f"  Selected nu distribution:\n{nested_df['Best_nu'].value_counts().sort_index()}")
+
+
+# Figure 5: nu selection — inner Phase 2 rate vs nu + nu histogram
+means_by_nu = [np.mean(all_outer_nu_means[nu]) for nu in nu_candidates]
+stds_by_nu  = [np.std(all_outer_nu_means[nu])  for nu in nu_candidates]
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+axes[0].plot(nu_candidates, means_by_nu, 'o-', color='#1f77b4', linewidth=2, markersize=7)
+axes[0].fill_between(nu_candidates,
+                     np.array(means_by_nu) - np.array(stds_by_nu),
+                     np.array(means_by_nu) + np.array(stds_by_nu),
+                     alpha=0.2, color='#1f77b4')
+axes[0].axvline(0.1, color='red', linestyle='--', linewidth=1.2, label='nu=0.1 (original)')
+axes[0].set_xlabel('nu', fontsize=12)
+axes[0].set_ylabel('Mean inner-fold discrimination score (%)', fontsize=12)
+axes[0].set_title('Discrimination Score vs nu\n(Phase 2 rate − mean Phase 1+3 rate; mean ± SD across 26 outer folds)', fontsize=10)
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+nu_counts = nested_df['Best_nu'].value_counts().reindex(nu_candidates, fill_value=0)
+axes[1].bar([str(nu) for nu in nu_candidates], nu_counts.values,
+            color='#1f77b4', edgecolor='black')
+axes[1].set_xlabel('Selected nu', fontsize=12)
+axes[1].set_ylabel('Number of outer folds', fontsize=12)
+axes[1].set_title('nu Selected by Inner LOSO\n(across 26 outer folds)', fontsize=11)
+axes[1].grid(True, axis='y', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join("figs", "nu_selection.png"), dpi=300)
+plt.show()
 
 
 # Figure 1: Bar chart with 95% bootstrap CI error bars
