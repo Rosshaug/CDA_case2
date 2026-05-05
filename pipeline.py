@@ -7,6 +7,7 @@ from sklearn.svm import OneClassSVM
 from sklearn.model_selection import LeaveOneGroupOut
 import scipy.stats as stats
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 data_path = os.path.join("data", 'HR_data_2.csv')
@@ -19,15 +20,19 @@ data_columns = [col for col in df.columns if col not in quastinare_columns + ["P
 
 df = df.dropna(subset=data_columns)
 
-
-
-scaled_data = []
-
+# --- NEW: List to collect average rates across experiments for the final chart ---
+chart_data = []
+# -------------------------------------------------------------------------------
 
 # loop over experiments (phase 1+3 and only phase 1)
 for experiment in [["phase1", "phase3"], ["phase1"]]:
+    exp_label = "_".join(experiment)
+    
+    df_experiment = df.copy()
+    scaled_data = []
+    
     # Isolate resting data per subject
-    for subject_id, subject_data in df.groupby('Individual'):
+    for subject_id, subject_data in df_experiment.groupby('Individual'):
         resting_data = subject_data[subject_data['Phase'].isin(experiment)]
         
         scaler = StandardScaler()
@@ -43,10 +48,7 @@ for experiment in [["phase1", "phase3"], ["phase1"]]:
     groups = df_scaled['Individual']
 
     results = []
-
     all_test_evaluations = []
-
-    print("Starting LOSO Cross-Validation...\n")
 
     for fold_idx, (train_index, test_index) in enumerate(logo.split(df_scaled, groups=groups)):
         
@@ -98,33 +100,68 @@ for experiment in [["phase1", "phase3"], ["phase1"]]:
         })
         
         test_q_data = test_df[test_df['Phase'] == "phase2"][quastinare_columns].copy()
-        
         test_q_data['Anomaly_Flag'] = (predictions_p2 == -1).astype(int) 
         test_q_data['Subject'] = test_subject
-        
         all_test_evaluations.append(test_q_data)
         
-        print(f"Subject {test_subject}: {rate_p2:.2f}% of puzzle phase flagged as anomalous.")
-
     results_df = pd.DataFrame(results)
-    print("\n--- Summary of Anomaly Detection ---")
-    print(results_df.describe())
+    loso_filename = os.path.join("output", f"loso_metrics_{exp_label}.csv")
+    results_df.describe().to_csv(loso_filename)
+    
 
-    print("\n--- Global Correlation with Questionnaires ---")
-    print("Interpreting the metric: A positive correlation means that when the model flagged an anomaly,")
-    print("the participant generally reported higher levels of that specific emotion.\n")
+    #print(results_df.describe())
+
+    model_name = "Trained on P1 & P3" if "phase3" in experiment else "Trained on P1 Only"
+    
+    chart_data.extend([
+        {'Phase': 'Phase 1 (Rest)', 'Anomaly Rate (%)': results_df['Rate_p1%'].mean(), 'Model': model_name},
+        {'Phase': 'Phase 2 (Puzzle)', 'Anomaly Rate (%)': results_df['Rate_p2%'].mean(), 'Model': model_name},
+        {'Phase': 'Phase 3 (Post-Rest)', 'Anomaly Rate (%)': results_df['Rate_p3%'].mean(), 'Model': model_name}
+    ])
 
     eval_df = pd.concat(all_test_evaluations, ignore_index=True)
+    correlation_results = []
 
     for emotion in quastinare_columns:
-        # Drop rows where the user might not have answered that specific question (NaN)
         clean_df = eval_df.dropna(subset=[emotion, 'Anomaly_Flag'])
         
         if len(clean_df) > 0:
-            # Calculate Point-Biserial correlation (binary flag vs continuous)
             corr, p_value = stats.pointbiserialr(clean_df['Anomaly_Flag'], clean_df[emotion])
-            
-            # Determine significance
             sig = "*" if p_value < 0.05 else ""
             
-            print(f"Emotion: {emotion.ljust(12)} | Correlation: {corr:+.3f} | p-value: {p_value:.3f} {sig}")
+            # Store in list
+            correlation_results.append({
+                'Emotion': emotion,
+                'Correlation': round(corr, 3),
+                'p_value': round(p_value, 3),
+                'Significant': "Yes" if p_value < 0.05 else "No"
+            })
+            
+            #print(f"Emotion: {emotion.ljust(12)} | Correlation: {corr:+.3f} | p-value: {p_value:.3f} {sig}")
+
+    corr_df = pd.DataFrame(correlation_results)
+    corr_filename = os.path.join("output", f"correlations_{exp_label}.csv")
+    corr_df.to_csv(corr_filename, index=False)
+
+
+plot_df = pd.DataFrame(chart_data)
+
+sns.set_theme(style="whitegrid")
+plt.figure(figsize=(10, 6))
+
+ax = sns.barplot(x='Phase', y='Anomaly Rate (%)', hue='Model', data=plot_df, palette=['#1f77b4', '#ff7f0e'])
+
+plt.ylabel('Average Anomaly Rate (%)', fontsize=12)
+plt.xlabel('Phase', fontsize=12)
+plt.ylim(0, 100)
+
+
+handles, labels = ax.get_legend_handles_labels()
+plt.legend(handles=handles, labels=labels, loc='upper left')
+
+plt.tight_layout()
+
+chart_filename = os.path.join("figs", "carry_over_effect_chart.png")
+plt.savefig(chart_filename, dpi=300)
+
+plt.show()

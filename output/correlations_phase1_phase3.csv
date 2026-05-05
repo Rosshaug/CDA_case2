@@ -1,0 +1,12 @@
+Emotion,Correlation,p_value,Significant
+Frustrated,0.004,0.964,No
+upset,-0.031,0.754,No
+hostile,0.007,0.946,No
+alert,0.26,0.008,Yes
+ashamed,-0.003,0.976,No
+inspired,0.212,0.031,Yes
+nervous,0.078,0.431,No
+attentive,0.28,0.004,Yes
+afraid,0.052,0.597,No
+active,0.282,0.004,Yes
+determined,0.284,0.003,Yes
